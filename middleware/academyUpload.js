@@ -1,10 +1,13 @@
 import multer from "multer";
-import fs from "fs";
 import path from "path";
+import fs from "fs";
 import os from "os";
 
+// Vercel serverless functions cannot reliably write to the project directory.
+// Use the temporary writable directory provided by the runtime.
 const uploadDir = path.join(os.tmpdir(), "academy");
 
+// Create the temporary upload directory if it doesn't exist.
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
@@ -15,13 +18,44 @@ const storage = multer.diskStorage({
   },
 
   filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}-${file.originalname}`;
-    cb(null, uniqueName);
+    const ext = path.extname(file.originalname);
+
+    const safeBase = path
+      .basename(file.originalname, ext)
+      .replace(/[^a-zA-Z0-9-_]/g, "_")
+      .slice(0, 60);
+
+    cb(null, `${req.userId}-${Date.now()}-${safeBase}${ext}`);
   },
 });
 
-const upload = multer({
+// Broad set of academic file types:
+// documents, spreadsheets, slides, images, archives, text
+const allowedExt =
+  /pdf|docx?|pptx?|xlsx?|txt|rtf|jpe?g|png|webp|gif|zip|rar|csv|md/i;
+
+const fileFilter = (req, file, cb) => {
+  const extOk = allowedExt.test(
+    path.extname(file.originalname).toLowerCase()
+  );
+
+  if (extOk) {
+    cb(null, true);
+  } else {
+    cb(
+      new Error(
+        "That file type isn't supported. Try PDF, Word, Excel, PowerPoint, images, text, or zip files."
+      )
+    );
+  }
+};
+
+const academyUpload = multer({
   storage,
+  fileFilter,
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25 MB per file
+  },
 });
 
-export default upload;
+export default academyUpload;
