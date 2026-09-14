@@ -2,406 +2,560 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import path from "path";
 import fs from "fs";
+import os from "os";
+
 import User from "../models/User.js";
 import Schedule from "../models/Schedule.js";
 import Note from "../models/Note.js";
 import PasswordResetRequest from "../models/PasswordResetRequest.js";
+
 import { validatePassword } from "../utils/validatePassword.js";
 import { hashToken, generateSecureToken } from "../utils/tokens.js";
 import { sendMail, isEmailConfigured } from "../utils/email.js";
 
-const RESET_TOKEN_TTL_MINUTES = Number(process.env.RESET_TOKEN_EXPIRES_MINUTES) || 60;
 
-const buildResetLink = (rawToken) => {
-  const base = process.env.CLIENT_URL || "http://localhost:5173";
-  return `${base.replace(/\/$/, "")}/reset-password?token=${rawToken}`;
-};
-
-const signToken = (user) => jwt.sign({ id: user._id, tv: user.tokenVersion }, process.env.JWT_SECRET, { expiresIn: "7d" });
-
-// Never include password/hash or internal fields — this is the only shape
-// of a user that is ever allowed to reach the frontend.
-const sanitizeUser = (user) => ({
-  id: user._id,
-  name: user.name,
-  email: user.email,
-  profileImage: user.profileImage,
-  resume: user.resume,
-  resumeOriginalName: user.resumeOriginalName,
-  resumeUploadedAt: user.resumeUploadedAt,
-  role: user.role,
-  mustChangePassword: user.mustChangePassword,
-  createdAt: user.createdAt,
-});
+// ============================================================
+// SIGNUP
+// ============================================================
 
 export const signup = async (req, res, next) => {
   try {
-    const { name, email, password, confirmPassword } = req.body;
+    const { name, email, password } = req.body;
 
-    if (!name || !email || !password || !confirmPassword) {
-      return res.status(400).json({ message: "All fields are required." });
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        message: "Name, email and password are required.",
+      });
     }
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ message: "Please enter a valid email address." });
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const existingUser = await User.findOne({
+      email: normalizedEmail,
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        message: "An account with this email already exists.",
+      });
     }
+
     const passwordError = validatePassword(password);
+
     if (passwordError) {
-      return res.status(400).json({ message: passwordError });
-    }
-    if (password !== confirmPassword) {
-      return res.status(400).json({ message: "Passwords do not match." });
-    }
-
-    const existing = await User.findOne({ email: email.toLowerCase() });
-    if (existing) {
-      return res.status(409).json({ message: "An account with this email already exists." });
+      return res.status(400).json({
+        message: passwordError,
+      });
     }
 
-    const hashed = await bcrypt.hash(password, 10);
-    const user = await User.create({ name, email: email.toLowerCase(), password: hashed });
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-    const token = signToken(user);
-    res.status(201).json({ token, user: sanitizeUser(user) });
+    const user = await User.create({
+      name: name.trim(),
+      email: normalizedEmail,
+      password: hashedPassword,
+    });
+
+    const token = jwt.sign(
+      {
+        id: user._id,
+        userId: user._id,
+        email: user.email,
+      },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: "7d",
+      }
+    );
+
+    res.status(201).json({
+      message: "Account created successfully.",
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        profileImage: user.profileImage,
+        resume: user.resume,
+      },
+    });
   } catch (err) {
     next(err);
   }
 };
+
+
+// ============================================================
+// LOGIN
+// ============================================================
 
 export const login = async (req, res, next) => {
   try {
     const { email, password } = req.body;
+
     if (!email || !password) {
-      return res.status(400).json({ message: "Email and password are required." });
+      return res.status(400).json({
+        message: "Email and password are required.",
+      });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const user = await User.findOne({
+      email: normalizedEmail,
+    });
+
     if (!user) {
-      return res.status(401).json({ message: "Invalid email or password." });
+      return res.status(401).json({
+        message: "Invalid email or password.",
+      });
     }
 
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) {
-      return res.status(401).json({ message: "Invalid email or password." });
+    const isMatch = await bcrypt.compare(password, user.password);
+
+    if (!isMatch) {
+      return res.status(401).json({
+        message: "Invalid email or password.",
+      });
     }
 
-    user.lastLoginAt = new Date();
-    await user.save();
-
-    const token = signToken(user);
-    res.json({ token, user: sanitizeUser(user) });
-  } catch (err) {
-    next(err);
-  }
-};
-
-// POST /api/auth/logout (protected) — bumps tokenVersion so the JWT that was
-// just used to authenticate this request stops being valid immediately.
-// Combined with the frontend deleting its stored token, this gives genuine
-// server-side session invalidation despite JWTs being otherwise stateless.
-export const logout = async (req, res, next) => {
-  try {
-    await User.findByIdAndUpdate(req.userId, { $inc: { tokenVersion: 1 }, $set: { lastLogoutAt: new Date() } });
-    res.json({ message: "Signed out successfully." });
-  } catch (err) {
-    next(err);
-  }
-};
-
-// POST /api/auth/admin-verify (public, rate-limited)
-// First step of the "Continue as Admin" flow: checks whether the given
-// email belongs to a real admin account. This is a UX gate only — it does
-// NOT itself grant access. The frontend still has to complete a real
-// password login (POST /api/auth/login) afterwards, and every /api/admin/*
-// route independently re-checks the account's role server-side regardless
-// of what happened here.
-export const adminVerify = async (req, res, next) => {
-  try {
-    const { email } = req.body;
-    if (!email || typeof email !== "string") {
-      return res.status(400).json({ message: "Please enter your admin email address." });
-    }
-
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user || user.role !== "admin") {
-      return res.status(404).json({ message: "No admin account found with this email." });
-    }
-
-    res.json({ valid: true, message: "Admin verified successfully." });
-  } catch (err) {
-    next(err);
-  }
-};
-
-export const getProfile = async (req, res, next) => {
-  try {
-    const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ message: "User not found." });
-
-    const [totalSchedules, finishedSchedules, pendingSchedules, totalNotes] = await Promise.all([
-      Schedule.countDocuments({ userId: req.userId }),
-      Schedule.countDocuments({ userId: req.userId, status: "Finished" }),
-      Schedule.countDocuments({ userId: req.userId, status: "Pending" }),
-      Note.countDocuments({ userId: req.userId }),
-    ]);
+    const token = jwt.sign(
+      {
+        id: user._id,
+        userId: user._id,
+        email: user.email,
+        role: user.role,
+      },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: "7d",
+      }
+    );
 
     res.json({
-      user: sanitizeUser(user),
-      stats: { totalSchedules, finishedSchedules, pendingSchedules, totalNotes },
+      message: "Login successful.",
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        profileImage: user.profileImage,
+        resume: user.resume,
+      },
     });
   } catch (err) {
     next(err);
   }
 };
+
+
+// ============================================================
+// LOGOUT
+// ============================================================
+
+export const logout = async (req, res) => {
+  res.json({
+    message: "Logged out successfully.",
+  });
+};
+
+
+// ============================================================
+// VERIFY ADMIN
+// ============================================================
+
+export const verifyAdmin = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId).select(
+      "-password"
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    if (user.role !== "admin") {
+      return res.status(403).json({
+        message: "Admin access required.",
+      });
+    }
+
+    res.json({
+      message: "Admin verified.",
+      user,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// GET PROFILE
+// ============================================================
+
+export const getProfile = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId).select(
+      "-password"
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    res.json({
+      user,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// UPDATE PROFILE
+// ============================================================
 
 export const updateProfile = async (req, res, next) => {
   try {
     const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ message: "User not found." });
 
-    if (req.body.name) user.name = req.body.name.trim();
-    if (req.file) user.profileImage = `/uploads/${req.file.filename}`;
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    const { name, email } = req.body;
+
+    if (name !== undefined) {
+      user.name = name.trim();
+    }
+
+    if (email !== undefined) {
+      const normalizedEmail = email.trim().toLowerCase();
+
+      const existingUser = await User.findOne({
+        email: normalizedEmail,
+        _id: { $ne: user._id },
+      });
+
+      if (existingUser) {
+        return res.status(409).json({
+          message: "Email is already in use.",
+        });
+      }
+
+      user.email = normalizedEmail;
+    }
+
+    if (req.file) {
+      user.profileImage = `/uploads/${req.file.filename}`;
+    }
 
     await user.save();
-    res.json({ user: sanitizeUser(user) });
+
+    res.json({
+      message: "Profile updated successfully.",
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        profileImage: user.profileImage,
+        resume: user.resume,
+      },
+    });
   } catch (err) {
     next(err);
   }
 };
 
-// ---------------------------------------------------------------------------
-// Resume — a single stored file per user (PDF/DOC/DOCX), replaced on every
-// new upload. The old file is removed from disk so uploads/ doesn't
-// accumulate orphaned files.
-// ---------------------------------------------------------------------------
 
-// POST /api/auth/profile/resume
-export const uploadResumeFile = async (req, res, next) => {
+// ============================================================
+// UPLOAD RESUME
+// ============================================================
+
+export const uploadResume = async (req, res, next) => {
   try {
-    if (!req.file) return res.status(400).json({ message: "No file received." });
-
     const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ message: "User not found." });
 
-    // Remove the previous resume file, if any, before pointing to the new one.
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        message: "Please choose a resume file.",
+      });
+    }
+
+    // Delete previous resume from temporary Vercel storage
     if (user.resume) {
-      const oldPath = path.join(process.cwd(), user.resume.replace(/^\//, ""));
+      const oldFilename = path.basename(user.resume);
+      const oldPath = path.join(
+        os.tmpdir(),
+        "uploads",
+        oldFilename
+      );
+
       fs.unlink(oldPath, () => {});
     }
 
     user.resume = `/uploads/${req.file.filename}`;
-    user.resumeOriginalName = req.file.originalname;
-    user.resumeUploadedAt = new Date();
+
     await user.save();
 
-    res.json({ user: sanitizeUser(user) });
+    res.json({
+      message: "Resume uploaded successfully.",
+      resume: user.resume,
+    });
   } catch (err) {
     next(err);
   }
 };
 
-// DELETE /api/auth/profile/resume
-export const deleteResumeFile = async (req, res, next) => {
+
+// ============================================================
+// DELETE RESUME
+// ============================================================
+
+export const deleteResume = async (req, res, next) => {
   try {
     const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ message: "User not found." });
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
 
     if (user.resume) {
-      const oldPath = path.join(process.cwd(), user.resume.replace(/^\//, ""));
+      const oldFilename = path.basename(user.resume);
+      const oldPath = path.join(
+        os.tmpdir(),
+        "uploads",
+        oldFilename
+      );
+
       fs.unlink(oldPath, () => {});
     }
-    user.resume = "";
-    user.resumeOriginalName = "";
-    user.resumeUploadedAt = null;
+
+    user.resume = null;
+
     await user.save();
 
-    res.json({ user: sanitizeUser(user) });
+    res.json({
+      message: "Resume deleted successfully.",
+    });
   } catch (err) {
     next(err);
   }
 };
 
-// ---------------------------------------------------------------------------
-// Password reset — admin-approved workflow
-// ---------------------------------------------------------------------------
 
-// POST /api/auth/forgot-password (public)
-// Always returns the same generic message regardless of whether the account
-// exists, to avoid account-enumeration. A request row is only actually
-// created when the account exists and there is no unresolved Pending
-// request already for it (prevents duplicate-request spam from one user).
-// POST /api/auth/forgot-password (public, rate-limited)
-// THE ACTUAL FIX: this previously only created a "Pending" request and
-// waited for an admin to manually review it in the Admin Panel — no email
-// was ever sent at this step, which is why users never received a reset
-// email. It now auto-generates a token and emails the reset link
-// immediately (true self-service "forgot password"), while still logging a
-// PasswordResetRequest record (auto-approved) so the existing Admin Panel
-// audit trail and admin-initiated reset flow keep working unchanged.
+// ============================================================
+// FORGOT PASSWORD
+// ============================================================
+
 export const forgotPassword = async (req, res, next) => {
-  const GENERIC_MESSAGE = "Password reset instructions have been sent to your email.";
   try {
-    const { identifier } = req.body;
-    if (!identifier || typeof identifier !== "string") {
-      return res.status(400).json({ message: "Please enter your registered email address." });
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        message: "Email is required.",
+      });
     }
 
-    const user = await User.findOne({ email: identifier.toLowerCase().trim() });
+    const normalizedEmail = email.trim().toLowerCase();
 
-    // Always return the same generic message whether or not the account
-    // exists, so the endpoint can't be used to enumerate registered emails.
-    if (!user) {
-      return res.json({ message: GENERIC_MESSAGE });
-    }
-
-    const request = await PasswordResetRequest.create({
-      userId: user._id,
-      email: user.email,
-      status: "Pending",
-      requestIp: req.ip || "",
+    const user = await User.findOne({
+      email: normalizedEmail,
     });
 
-    const rawToken = generateSecureToken();
-    request.resetTokenHash = hashToken(rawToken);
-    request.resetTokenExpires = new Date(Date.now() + RESET_TOKEN_TTL_MINUTES * 60 * 1000);
-    request.status = "Approved";
-    request.method = "link";
-    request.reviewedAt = new Date();
-    // reviewedBy stays null — this was approved automatically by the
-    // self-service flow, not by an admin. The Admin Panel can still see and
-    // audit it like any other request.
-    await request.save();
-
-    const resetLink = buildResetLink(rawToken);
-
-    if (isEmailConfigured()) {
-      const emailResult = await sendMail({
-        to: user.email,
-        subject: "Password Reset – Study Planner",
-        text: `Hello,\n\nYour password reset request has been processed.\n\nYou can use the secure password-reset link below to create a new password:\n${resetLink}\n\nFor your security, this link expires in ${RESET_TOKEN_TTL_MINUTES} minutes.\n\nIf you did not request this password reset, please ignore this email.\n\nRegards,\nStudy Planner Team`,
-        html: `<p>Hello,</p><p>Your password reset request has been processed.</p><p>You can use the secure password-reset link below to create a new password:</p><p><a href="${resetLink}">Reset Password</a></p><p>For your security, this link expires in ${RESET_TOKEN_TTL_MINUTES} minutes.</p><p>If you did not request this password reset, please ignore this email.</p><p>Regards,<br/>Study Planner Team</p>`,
+    // Don't reveal whether email exists
+    if (!user) {
+      return res.json({
+        message:
+          "If an account exists with this email, a password reset link has been sent.",
       });
-      // Errors from sendMail are already caught and logged inside sendMail
-      // itself (see utils/email.js) — never thrown here, and never surfaced
-      // to the client, so we still can't leak account existence via timing
-      // or error responses. If delivery genuinely fails, the request stays
-      // "Approved" in the Admin Panel so an admin can hand the user the
-      // link manually as a fallback.
-      if (!emailResult.sent) {
-        console.error(`forgotPassword: email delivery did not succeed for request ${request._id}: ${emailResult.reason}`);
-      }
-    } else {
-      console.warn(
-        "forgotPassword: EMAIL_SERVER/EMAIL_FROM are not configured — no email was sent. " +
-          "Set both in backend/.env, or an admin can retrieve/share the link manually from the Admin Panel."
-      );
     }
 
-    res.json({ message: GENERIC_MESSAGE });
+    if (!isEmailConfigured()) {
+      return res.status(500).json({
+        message: "Email service is not configured.",
+      });
+    }
+
+    const rawToken = generateSecureToken();
+    const tokenHash = hashToken(rawToken);
+
+    await PasswordResetRequest.deleteMany({
+      userId: user._id,
+      used: false,
+    });
+
+    await PasswordResetRequest.create({
+      userId: user._id,
+      tokenHash,
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+      used: false,
+    });
+
+    const frontendUrl =
+      process.env.FRONTEND_URL ||
+      "http://localhost:5173";
+
+    const resetUrl = `${frontendUrl}/reset-password?token=${rawToken}`;
+
+    await sendMail({
+      to: user.email,
+      subject: "Password Reset Request",
+      html: `
+        <h2>Password Reset</h2>
+        <p>Hello ${user.name || "User"},</p>
+        <p>We received a request to reset your password.</p>
+        <p>
+          <a href="${resetUrl}">
+            Click here to reset your password
+          </a>
+        </p>
+        <p>This link will expire in 30 minutes.</p>
+        <p>If you did not request this, you can safely ignore this email.</p>
+      `,
+    });
+
+    res.json({
+      message:
+        "If an account exists with this email, a password reset link has been sent.",
+    });
   } catch (err) {
     next(err);
   }
 };
 
-// POST /api/auth/reset-password (public — authenticated by the token itself)
-// Consumes a single-use token that an admin generated when approving a
-// request. Sets the new password, invalidates existing sessions, and marks
-// the request Completed.
+
+// ============================================================
+// RESET PASSWORD
+// ============================================================
+
 export const resetPassword = async (req, res, next) => {
   try {
-    const { token, newPassword, confirmPassword } = req.body;
-    if (!token) {
-      return res.status(400).json({ message: "Missing reset token." });
+    const { token, password } = req.body;
+
+    if (!token || !password) {
+      return res.status(400).json({
+        message: "Token and new password are required.",
+      });
     }
-    if (newPassword !== confirmPassword) {
-      return res.status(400).json({ message: "Passwords do not match." });
-    }
-    const passwordError = validatePassword(newPassword);
+
+    const passwordError = validatePassword(password);
+
     if (passwordError) {
-      return res.status(400).json({ message: passwordError });
+      return res.status(400).json({
+        message: passwordError,
+      });
     }
 
     const tokenHash = hashToken(token);
-    const request = await PasswordResetRequest.findOne({ resetTokenHash: tokenHash }).select("+resetTokenHash");
 
-    if (!request) {
-      return res.status(400).json({ message: "This reset link is invalid. Please request a new one." });
-    }
-    if (request.status === "Completed") {
-      return res.status(400).json({ message: "This reset link has already been used." });
-    }
-    if (request.status === "Rejected") {
-      return res.status(400).json({ message: "This reset request was not approved." });
-    }
-    if (request.status === "Expired" || (request.resetTokenExpires && request.resetTokenExpires < new Date())) {
-      request.status = "Expired";
-      await request.save();
-      return res.status(400).json({ message: "This reset link has expired. Please submit a new request." });
-    }
-    if (request.status !== "Approved") {
-      return res.status(400).json({ message: "This reset link is invalid. Please request a new one." });
+    const resetRequest = await PasswordResetRequest.findOne({
+      tokenHash,
+      used: false,
+      expiresAt: { $gt: new Date() },
+    });
+
+    if (!resetRequest) {
+      return res.status(400).json({
+        message: "Invalid or expired password reset token.",
+      });
     }
 
-    const user = await User.findById(request.userId);
+    const user = await User.findById(resetRequest.userId);
+
     if (!user) {
-      return res.status(400).json({ message: "This reset link is invalid." });
+      return res.status(404).json({
+        message: "User not found.",
+      });
     }
 
-    user.password = await bcrypt.hash(newPassword, 10);
-    user.mustChangePassword = false;
-    user.tokenVersion += 1; // invalidate any existing sessions for this user
+    user.password = await bcrypt.hash(password, 10);
+
     await user.save();
 
-    request.status = "Completed";
-    request.completedAt = new Date();
-    request.resetTokenHash = undefined;
-    request.resetTokenExpires = null;
-    await request.save();
+    resetRequest.used = true;
 
-    res.json({ message: "Password reset successfully. You can now sign in." });
+    await resetRequest.save();
+
+    res.json({
+      message: "Password reset successfully.",
+    });
   } catch (err) {
     next(err);
   }
 };
 
-// POST /api/auth/change-password (protected)
-// Used both for a voluntary password change and for the forced "first
-// login after a temporary password" flow — in both cases the user proves
-// they know the current/temporary password before setting a new one.
+
+// ============================================================
+// CHANGE PASSWORD
+// ============================================================
+
 export const changePassword = async (req, res, next) => {
   try {
-    const { currentPassword, newPassword, confirmPassword } = req.body;
-    if (!currentPassword || !newPassword || !confirmPassword) {
-      return res.status(400).json({ message: "All fields are required." });
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        message:
+          "Current password and new password are required.",
+      });
     }
-    if (newPassword !== confirmPassword) {
-      return res.status(400).json({ message: "Passwords do not match." });
-    }
+
     const passwordError = validatePassword(newPassword);
+
     if (passwordError) {
-      return res.status(400).json({ message: passwordError });
+      return res.status(400).json({
+        message: passwordError,
+      });
     }
 
     const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ message: "User not found." });
 
-    const match = await bcrypt.compare(currentPassword, user.password);
-    if (!match) {
-      return res.status(401).json({ message: "Current password is incorrect." });
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    const isMatch = await bcrypt.compare(
+      currentPassword,
+      user.password
+    );
+
+    if (!isMatch) {
+      return res.status(400).json({
+        message: "Current password is incorrect.",
+      });
     }
 
     user.password = await bcrypt.hash(newPassword, 10);
-    user.mustChangePassword = false;
-    user.tokenVersion += 1;
+
     await user.save();
 
-    // Issue a fresh token so this same session continues working (the old
-    // one is now invalid because tokenVersion changed).
-    const token = signToken(user);
-    res.json({ message: "Password changed successfully.", token, user: sanitizeUser(user) });
+    res.json({
+      message: "Password changed successfully.",
+    });
   } catch (err) {
     next(err);
   }
 };
-
-export { RESET_TOKEN_TTL_MINUTES };
